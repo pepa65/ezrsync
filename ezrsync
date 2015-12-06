@@ -1,0 +1,1158 @@
+#!/bin/bash
+
+set -o nounset -o pipefail -o errtrace
+set +o xtrace +o verbose +o errexit
+# nounset: unset variables give error
+# pipefail: any failing part of pipe returns fail
+# errexit: exit immediately on first error
+# errtrace: functions inherit ERR-trap
+# -xtrace: print commands+arguments
+# -verbose: print shell input lines as read
+
+#######################################################################################################################
+#
+## ezrsync 0.59-beta
+#
+# Git repo: http://github.com/pepa65/ezrsync
+#
+# Copyright 2012-2015 by dagurasuforge, pepa65 (sourceforge.net ids)
+# License GNU GPLv3+  <http://gnu.org/licenses/gpl.html>
+# This is free software: you are free to change and redistribute it.
+# There is NO WARRANTY, to the extent permitted by law.
+#
+### Overview
+#
+# An rsnapshot-like tool which uses fixed time-stamped directories instead of rotations.
+# The initial author dagurasuforge has seen many rsnapshot-like scripts/programs, mostly based on Mike Rubels blog,
+# with no real updates to the idea other than added usability features. Thus most use sync/rotate/promote
+# with complex crontab structures that require careful timing and use of BOTH cron AND anacron
+# to deal with hourly backups as well as daily, weekly, etc. on a system with downtimes.
+# Using only cron, systems could miss daily, weekly, monthly or yearly backups entirely.
+# Without using cron, hourly backups can't be done well.
+# (Mike Rubel's original method was the most efficent way to explain how people could get something working
+# using available tools and minimal work, but if we're writing a program, we can do better.)
+#
+# So ezrsync delivers precisely the same result (multiple intervals of retention) with only one standard call
+# from cron that does all within one cycle (typically hourly, but it could be longer or shorter),
+# without the need for anacron. There is no need for renaming, rotating, or promoting any backups after
+# they are made, but the required number of daily, weekly, monthly and yearly backups are garanteed to be retained.
+#
+#
+### Requirements
+#
+# bash, rsync, ln, mv, rm, date, find, grep and optionally cpio in $PATH
+#
+# (ln provides 1 service, can be removed; grep could be eliminated with some work;
+#  find, date, mv, rm and rsync are fairly essential; bash is indispensable;
+#  cpio is optional, mandatory if directive 'cpio' has 1 as argument)
+#
+# Bash-version compatibility: bash-3.0 (which introduced array index expansion: ${!array[@]})
+#
+#
+### Use
+#
+# 1. Prepare a configuration-file patterned after rsnapshot:
+#    Use hourly, daily, weekly, monthly or yearly as interval names, or define other ones.
+#    Use only source/destination backup definitions (extra per-backup options will be ignored).
+#    All non-implemented or unapplicaple directives will be flagged but ignored.
+#    The 'snapshot_root'/'destdir' combinations of different configurations must not be the same directory,
+#    unless all interval names are different.
+#
+# 2. Either place the config in '/etc/ezrsync.conf' or in '/etc/ezrsync.conf.d/' or run this script as:
+#
+#    'ezrsync --mainconf <configfile>'  or  'ezrsync --soleconf <configfile>'
+#
+#    If there are scripts present in '/etc/ezrsync.conf.d/' directory, they are (also) all run. This directory
+#    can only be changed in the main configuration file, either in the default one or in the one given
+#    as a commandline option after '--mainconf'.
+#     When '--soleconf' is used, only the specified config file is used, and none of the scripts in any directory.
+#    The 'lockfile' and 'stop_on_stale_lockfile' directives can only be used in either the sole or the main
+#    configuration-file, and not in any of the files in a configuration directory (because there will only be
+#    one logfle and lockfile for the whole run).
+#    The 'confdir' directive (to specify an alternate configuration directory) can only be set in
+#    the main configuration file. If a sole configuration file is specified, it will be the only one used.
+#    If a main configuration file is present at the default location or specified, it will be used first,
+#    and then all the configuration files that are present in the default or specified configuration directory.
+#    For each configuration file, all unspecified directives will be reset to default.
+#
+# 3. Run ezrsync in a single cron entry, no arguments required, like this (for example every 15 minutes):
+#
+#	   */15 * * * *  root  /usr/local/bin/ezrsync
+#
+#	   It should be run at the smallest interval that is used (or more often), but it won't run if another instance 
+#    is still running. If the cron-interval is bigger than the smallest interval, chances are the larger intervals
+#    never get any backups. (A crontab.d script could be packaged with ezrsync without needing user intervention,
+#    except if the smallest used interval is smaller than the crontab that is packaged.)
+#
+# 4. If the source is empty, the backup will not proceed, so backups will not be erased.
+#
+#    So if you use sources that are mounted, make sure the mount-directories are empty when not mounted!
+#    A good idea is to use 'chattr +i' when unmounted to make them unwritable even to root, because
+#    files tend to get accidentally written to unmounted mount points. Backups will over time be replaced
+#    by the files that are present in unmounted source directories. Even if this happens once, the hard links
+#    will be broken, causing more storage space to be used on the destinations!
+#
+#
+### Missing features compared to rsnapshot
+#
+# - The 'config_version' directive is ignored.
+# - All 'cmd_' directives are ignored except 'cmd_rsync', 'cmd_preexec' and 'cmd_postexec'.
+#   (ssh, logger, du, rsnapshot-diff are not used, nor any perl-builtin)
+# - LVM is not explixitly supported, so 'linux_lvm_' directives are ignored.
+# - The 'ssh_args' directive is ignored (because ssh-support is not built in, but it should just work).
+# - The 'du_args' directive is ignored (because du is not used).
+# - The 'one_fs' directive is ignored, so '-x' should be given as an rsync argument if desired.
+# - The 'include', 'exclude', 'include_file' and 'exclude_file' directives are ignored, so they should be
+#   added as rsync arguments if they are needed.
+# - The 'sync_first' directive is ignored (as there is no rotation, sync_first always happens).
+# - The 'lazy_deletes' directive is ignored (they happen by default).
+# - Per-backup arguments are ignored, so only 2 arguments for the 'backup' directive.
+#   Multiple configuration-files can be used instead.
+# - No support for the 'backup_script' directive.
+#
+#
+### Special features
+#
+# 1. Compatibility with the rsnapshot configuration-file:
+#   - They can be processed, but might not fully work as expected unless attention is paid to the Missing features
+#     above. Both 'retain' and 'interval' directives are understood, and the final argument can be the definition of
+#     the interval (required for interval names other than hourly, daily, weekly, monthly and yearly).
+#   - These rsnapshot directives are recognised and implemented: 'snapshot_root', 'no_create_root', 'cmd_rsync',
+#     'cmd_preexec', 'cmd_postexec', 'retain'/'interval', 'verbose', 'loglevel', 'logfile', 'lockfile', 'stop_on_stale_lockfile',
+#     'rsync_short_args', 'rsync_long_args', 'link_dest' (which by default uses 'find|cpio') and 'backup'.
+#     In addition, the following directives are implemented:
+#     - 'timestamplog' (takes 0/1) to specify whether the logfile needs to be time-stamped
+#     - 'confdir' to specify a configuration-file-directory different from the default
+#     - 'rsync_tries' (takes a positive integer) to specify how many times the rsync-command needs to be tried
+#     - 'cpio' (takes 0/1) to specify whether 'cpio' or 'cp -al' is used
+#     - 'reuse_trash' (takes 0/1) to use expired backups as a rsync target in order to skip prelinking
+#     (Note: while 'rsync --link-dest' does keep the permissions history, it does so at the expense of
+#     not hard-linking otherwise identical files. So in case all file permisions get changed,
+#     backing up using '--link-dest' will copy all files instead of hard-linking them!)
+#   - Directives and arguments are seperated by tabs. All directives have 1 argument, except:
+#     - retain/interval: '<interval> <retain> [<definition>]' (if no definition, <interval> must be standard)
+#     - backup: '<source-directory> <destination-directory>'
+#   - There can only be more than one of the 'interval'/'retain' and 'backup' directives.
+#     If either of these is not present at all, nothing will happen.
+#   - The 'snapshot_root' directive is the only directive that is mandatory, all others have defined default values.
+#
+# 2. The script can be run more often than the smallest backup cycle that is used, or less often (in the latter case
+#    the larger interval backups might never happen). No worrying about cron jobs interfering with one another.
+#
+# 3. No anacron is needed. If the computer is off for a period, required backups will be made at the next run
+#    if/when appropriate, and as many backups for each interval will be kept as specified.
+#
+# 4. The directory-names for ezrsync carry both an explicit time stamp and the interval name.
+#    In case (for example) yearly backups were made when the files were a mess that day, they can
+#    just be deleted, and new ones will be made on next run.
+#    The most recent backup is linked to by the symlink '$symlinkname' (set to 'MostRecentBackup' by default).
+#
+# 5. Forced backups are supported with the '--forced' option followed by an interval name.
+#    They do not count towards the total number of backups to be kept for that particular interval.
+#    They will eventually get pushed out by regular backups for that interval when there are a
+#    sufficient number of newer regular backups. The regular backups are always properly spaced in time.
+#    So in case (for example) 'retain hourly 10', and 10 hourly backups are forced in one hour, the old
+#    hourly backups will still be kept and slowly be replaced by newer regular hourly backups, and
+#    eventually the forced backups will be deleted when they get older than the oldest of the regular 10.
+#
+# 6. Independent, persistent backups can be made with the '--independent' option. These never get automatically deleted
+#    and do not interact with the deletion schedule of other interval backups at all.
+#
+# 7. In case of interruptions, there is a roll forward or roll back mechanism in place
+#     to guard against deletions.
+#
+# 8. Empty source directories are never backed up. This is really a minimal check, but stricter criteria
+#    like tagging backup-sources with hidden files won't work for read-only sources and may just prevent backups.
+#
+# 9. Different interval specifications can be applied to different sets of backup directives
+#    by using separate configfiles.
+#
+#
+### Potential concerns
+#
+# A date-based system is vulnerable to missed backups or auto-deletion if there is a clock error.
+# Much consideration has been given to this issue in the details of the logic.
+# If any backups exists 'in the future', the program is aborted. But a clock jump to the past
+# does not threaten existing backups anyway, it just won't make new ones, so has to be detected.
+# If the clock jumps forward (for example 2 months, perhaps the machine had just been switched off),
+# things are fine. Your backups, while suddenly being older, will not all suddenly get expired,
+# because expiry is based on count within an interval, and not based on time.
+#
+#
+### Implementation
+#
+# For all intervals, starting with the shortest interval:
+#
+# - if due: make the backups
+# - if retain fulfilled: remove the obsolete (possibly forced) backups
+# - if retain not yet fulfilled, look to use trashed backups ('optional rotation')
+#   (in principle, the prelink+rsync happens only once per run at most)
+#
+#######################################################################################################################
+
+
+#######################################################################################################################
+# Global variables
+#######################################################################################################################
+
+# redirect stdout and stderr
+exec 3<&1 4<&2
+
+# general
+declare -r self='ezrsync'
+declare -r version='0.58-beta'
+declare -r mainpid=$$
+declare -r PS4='${LINENO-} ${FUNCNAME-}: '
+
+# program logic
+declare configfile
+declare -i verboseoverride  # flag: commandline --verbose set
+declare -i logready  # flag: only start writing to logfile when set
+declare -r symlinkname='MostRecentBackup'
+
+## global variables that can be modified in functions must be declared only there!
+# Getbackup: global variable set in function Getbackup
+# Readlink: global variable set in function Readlink
+# Trash_backup: global variable set in function Trash_backup
+
+# standard intervals that don't need to be defined in configfile (but can be redefined)
+declare -r std_interval=(hourly daily weekly monthly yearly)
+declare -r std_intervaldef=('1 hour' '1 day' '7 days' '1 month' '1 year')
+declare -r LC_COLLATE='C'	 # dictionary order for sorting: C provides uniqueness for all characters
+
+# commandline declare mainconf soleconf forced_interval now declare -i
+declare -i verbose strict independent
+
+# main configfile
+declare logfile lockfile confdir
+declare -i stop_on_stale_lockfile timestamplog
+
+# configfile
+declare -i link_dest no_create_root rsync_tries cpio reuse_trash loglevel
+declare cmd_rsync rsync_short_args rsync_long_args
+# some arrays start at 1: directive
+declare -a directive argument1 argument2 argument3 interval intervalretain intervaldef sourcedir destdir
+
+# backup name pattern for grep regular-expressions and filename-globbing
+declare -r bn='[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]_[012][0-9]:[0-5][0-9]:[0-5][0-9]'
+# date format string
+declare -r dateformat='+%Y-%m-%d_%H:%M:%S'
+
+# Exit codes
+# Exit 1: nounset (undeclared variable)
+declare -r -i E_commandline=2  # Commandline error
+declare -r -i E_configfile=3  # Configfile error
+declare -r -i E_operation=4  # Operational error
+declare -r -i E_internal=5  # Internal logic error
+declare -r -i E_missingcommand=6  # Application not present in PATH
+declare -r -i E_strict=7  # Warning and strict set
+declare -r -i E_INT=8  # Trapped INT
+declare -r -i E_TERM=9  # Trapped TERM
+
+
+#######################################################################################################################
+# Echo:  called from many places
+# Purpose:  Output a log message to stderr when verbose is set to $1 or more, and to $logfile when
+#           loglevel is defined and set to $3  or more (or $1 or more if $3 is the log message)
+#           The log message shouldn't be just an integer!
+# Args:  $1 Verbosity
+#        $2 Log message
+#        $3 (optional) Loglevel
+# Output to stderr and file $logfile
+#######################################################################################################################
+
+Echo() {
+	local -i level
+	[[ ${3-} == [012345] ]] && level=$3 || level=$1
+	((verbose > $1)) && printf "%s/n" "${2-}" >&3
+	((logready)) && [[ ${loglevel-} ]] && ((loglevel > level)) && printf "%s/n" "${2-}" >>"$logfile"
+}
+
+
+#######################################################################################################################
+# Exit_script:  called from Initialize, Die and Finish (and trapping all exits)
+# Purpose:  Removing the lockfile
+# Args:  $1 Exit code
+#######################################################################################################################
+
+Exit_script() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	Echo 0
+	(($1==10)) && Echo 0 "Script $self INTerrupted"
+	(($1==11)) && Echo 0 "Script $self TERMinated"
+	[[ -f $lockfile ]] && command rm -- "$lockfile"
+	((verbose > 1)) && times >&3
+	((logready)) && ((loglevel > 1)) && times >>"$logfile"
+	exit $1
+}
+
+
+#######################################################################################################################
+# Die:  called from many places
+# Purpose:  Terminate abnormally with error
+# Args:  $1 Error message
+#        $2 Exit code
+#######################################################################################################################
+
+Die() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	Echo 0
+	Echo 0 "ERROR: $1"
+	Echo 0 "Aborting $self abnormally"
+	Exit_script $2
+}
+
+
+#######################################################################################################################
+# Warn:  called from Single_argument (called from Startup)
+# Purpose:  Log a warning message, and terminate if strict=1
+# Args:  $1 Error message
+#######################################################################################################################
+
+Warn() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	Echo 0 "    WARNING: $1"
+	((strict)) && Die 'Warning issued, strict is set' $E_strict
+}
+
+
+#######################################################################################################################
+# Config:  called from Initialize and Post_exec
+# Purpose:  Set per-configfile defaults
+#######################################################################################################################
+
+Config() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	# variables that can be set in the configfile
+	logfile="/var/log/$self.log"
+	timestamplog=0
+	link_dest=0 no_create_root=1 rsync_tries=1 cpio=0 reuse_trash=0 loglevel=2
+	cmd_rsync='/usr/bin/rsync'
+	#ntfs: rsync_short_args='-rlHtD'
+	#ext: rsync_short_args='-rlHptgoD'
+	rsync_short_args='-rlHptgoD'
+	#ntfs: rsync_long_args='--delete --numeric-ids --relative --delete-excluded --modify-window=1'
+	#ext: rsync_long_args='--delete --numeric-ids --relative --delete-excluded'
+	rsync_long_args='--delete --numeric-ids --relative --delete-excluded'
+	directive=()
+	argument1=()
+	argument2=()
+	argument3=()
+	interval=()
+	intervalretain=()
+	intervaldef=()
+	sourcedir=()
+	destdir=()
+}
+
+
+#######################################################################################################################
+# Initialize:  called from main
+# Purpose:  Set defaults and initialize, process commandline
+# Args:  $@
+#######################################################################################################################
+
+Initialize() {
+	#Echo 2 " <$*> ${FUNCNAME[@]}"  # Echo cannot properly be processed yet
+	trap 'Exit_script' $E_INT $E_TERM
+
+	# set bash-options
+	shopt -s nullglob dotglob
+
+	verboseoverride=0  # flag: commandline --verbose set
+	logready=0
+
+	# set defaults that can only be overridden by commandline options
+	mainconf="/etc/${self}.conf"
+	[[ -f $mainconf ]] || mainconf=
+	soleconf=
+	forced_interval=
+	verbose=1  # can also be set by the main configfile, but commandline takes precedence
+	strict=0
+	independent=0
+	# the time that is used (unless overridden from the commandline)
+	now="$(command date $dateformat)"  # current date in format for backups
+
+	# set defaults that can only be overridden by main configfile
+	lockfile="/var/run/$self.pid"
+	confdir="/etc/$self.conf.d"
+	stop_on_stale_lockfile=0
+
+	# set defaults that can be overridden by any configfile
+	Config
+
+	# check needed commands
+	local n needed='rsync cpio find ln mv rm date grep'
+	local -i missing=0
+	for n in $needed
+	do
+		if ! command -v "$n" &>/dev/null
+		then
+			if [[ ! $n = 'cpio' ]] || ((cpio))
+			then  # only flag missing cpio when necessary
+				Echo 0 "Necessary command not found in PATH: $n"
+				let ++missing
+			fi
+		fi
+	done
+	((missing)) && Die "Number of commands missing: $missing" $E_missingcommand
+
+	# parse commandline
+	while [[ ${1-} ]]
+	do
+		case $1 in
+			'') ;;
+			--help|-h)
+				printf "%s\n\n" "
+ USAGE:
+   $self [<OPTIONS>..]
+
+ OPTIONS:
+   --help | -h                            Output this message
+   --mainconf <main configuration-file> 	Override standard main configuration-file
+   --soleconf <sole configuration-file>   Only use sole configuration-file (overrides mainconf/confdir)
+   --force | -f <interval>                Force a backup for supplied interval
+   --independent | -i [<nametag>]         Create a independent backup, <nametag> is optional
+   --date | -d <YYYY-MM-DD@HH:MM:SS>      Override system date for this run
+   --strict | -s [<1/0>]                  Terminate on warnings when set
+   --verbose <level: 0/1/2/3/4/5> | -v..  Verbosity of output (overrides configuration-file)"
+				exit 0 ;;
+			--mainconf)
+				mainconf="${2-}"
+				[[ -f $mainconf ]] || Die "No regular file after the --mainconf option: $mainconf" $E_commandline
+				Echo 0 "--mainconf option: Main configuration-file: $mainconf"
+				shift 2 ;;
+			--soleconf)
+				soleconf="${2-}"
+				[[ -f $soleconf ]] || Die "No regular file after the --soleconf option: $soleconf" $E_commandline
+				Echo 0 "--soleconf option: Sole (non-main) configuration file: $soleconf"
+				shift 2 ;;
+			--force|-f)
+				forced_interval="${2-}"
+				[[ -z $forced_interval ]] && Die 'No interval supplied to the --forced option, eg. --forced hourly' $E_commandline
+				Echo 0 "--forced option: Forced backup for $forced_interval, unless a backup was due anyway"
+				shift 2 ;;
+			--independent|-i)
+				independent=1
+				independent_name="${2-}"
+				if [[ -z $independent_name || $independent_name == -* ]]
+				then  # not supplied
+					independent_name='independent'
+				else
+					shift
+				fi
+				Echo 0 "--independent option: independent backup requested, name-tag will be $independent_name"
+				shift ;;
+			--date|-d)
+				now="${2-}"
+				[[ $now == $bn ]] || Die "Date format must be YYYY-MM-DD_HH:MM:SS instead of $now" $E_commandline
+				Echo 0 "--date option: Supplied date: $now"
+				shift 2 ;;
+			--strict|-s)
+				strict="${2-}"
+				if [[ -z $strict || $strict == -* ]]
+				then  # not supplied
+					strict=1
+				else
+					[[ $strict == [01] ]] || Die "Option strict must be 0/1, not: $strict" $E_commandline
+					shift
+				fi
+				Echo 0 "--strict option to terminate on warnings: set to $strict"
+				shift ;;
+			-v)
+	 			verboseoverride=1
+				((++verbose > 5)) && Echo 0 'Option verbose already set to maximum: 5'
+				shift ;;
+			--verbose)
+	 			verboseoverride=1
+				verbose=${2-}
+				[[ -z $verbose || $verbose == -* ]] && Die 'Option --verbose: value not supplied' $E_commandline
+				[[ $verbose == [012345] ]] || Die "Option --verbose: value must be 0/1/2/3/4/5, not: $verbose" $E_commandline
+				Echo 0 "--verbose option: set to $verbose, possibly overriding configuration-file"
+				shift 2 ;;
+			-*) Die "Unrecognized commandline option: $1" $E_commandline ;;
+			*) Die "Unrecognized commandline argument: $1" $E_commandline ;;
+		esac
+	done
+
+	((verbose > 3)) && set -o xtrace
+	((verbose > 4)) && set -o verbose
+	((verbose > 3)) && set && shopt
+}
+
+
+#######################################################################################################################
+# Single_argument:  called from Startup
+# Purpose:  Assign and error check the configfile directives with only 1 argument
+# Args:  $1 Current array-subscript in directive (and argument1/2/3)
+#######################################################################################################################
+
+Single_argument() {
+	Echo 2  " ${FUNCNAME[@]} $1"
+	Echo 0 "  ${directive[$1]}=${argument1[$1]}"
+	[[ ${argument1[$1]-} ]] || Warn "directive ${directive[$1]} has no arguments"
+	[[ ${argument2[$1]-} ]] &&\
+			Warn "directive ${directive[$1]} should only have 1 argument: ${argument1[$1]}"
+	case "${directive[$1]}" in
+		snapshot_root)
+			snapshot_root=${argument1[$1]}
+			[[ $snapshot_root == /* ]] || Warn "snapshot_root is a relative directory: $snapshot_root" ;;
+		no_create_root)
+			no_create_root=${argument1[$1]}
+			[[ $no_create_root == [01] ]] || Warn "no_create_root can only be 0 or 1, not: $no_create_root" ;;
+		verbose)
+			if ((verboseoverride))
+			then
+				Warn "verbose directive ignored, already set on commandline"
+			else
+				verbose=${argument1[$1]}
+				if [[ $verbose != [012345] ]]
+				then
+					Warn "verbose can only be 0/1/2/3/4/5, value 1 is used instead of: $verbose"
+					verbose=1
+				fi
+			fi ;;
+		loglevel)
+			loglevel=${argument1[$1]}
+			if [[ $loglevel != [012345] ]]
+			then
+				Warn "loglevel can only be 0/1/2/3/4/5, value 2 is used instead of: $loglevel"
+				loglevel=2
+			fi ;;
+		cmd_rsync)
+			cmd_rsync=${argument1[$1]}
+			[[ -x $cmd_rsync ]] || Warn "cmd_rsync is not executable: $cmd_rsync" ;;
+		cpio)
+			cpio=${argument1[$1]}
+			[[ $cpio == [01] ]] || Warn "cpio can only be 0 or 1, not: $cpio" ;;
+		reuse_trash)
+			reuse_trash=${argument1[$1]}
+			[[ $reuse_trash == [01] ]] || Warn "reuse_trash can only be 0 or 1, not: $reuse_trash" ;;
+		rsync_tries)
+			rsync_tries=${argument1[$1]}
+			if ((rsync_tries < 1))
+			then
+				Warn "rsync_tries needs to be a positive integer, value 1 is used instead of $rsync_tries"
+				rsync_tries=1
+			fi ;;
+		link_dest)
+			link_dest=${argument1[$1]}
+			[[ $link_dest == [01] ]] || Warn "link_dest has invalid value: $link_dest" ;;
+		rsync_short_args)
+			rsync_short_args=${argument1[$1]} ;;
+		rsync_long_args)
+			rsync_long_args=${argument1[$1]} ;;
+		cmd_preexec)
+			cmd_preexec=${argument1[$1]}
+			[[ -x $cmd_preexec ]] || Warn "cmd_preexec is not executable: $cmd_preexec" ;;
+		cmd_postexec)
+			cmd_postexec=${argument1[$1]}
+			[[ -x $cmd_postexec ]] || Warn "cmd_postexec is not executable: $cmd_postexec" ;;
+		confdir)
+			if [[ $configfile = "$mainconf" ]]
+			then
+				confdir=${argument1[$1]}
+				[[ -d "$confdir" ]] || Warn 'confdir directive does not specify a proper directory'
+			else
+				Warn 'confdir directive ignored in non-main configuration-file'
+			fi ;;
+		logfile)  # read in Startup
+			;;
+		timestamplog)  # read in Startup
+			[[ $timestamplog == [01] ]] || Warn "timestamplog can only be 0 or 1, not: $timestamplog" ;;
+		lockfile)  # read in Startup
+			[[ $configfile = "$soleconf" || $configfile = "$mainconf" ]] || Warn 'lockfile directive ignored in configuration-directory-file' ;;
+		stop_on_stale_lockfile)  # read in Startup
+			[[ $configfile = "$soleconf" || $configfile = "$mainconf" ]] || Warn 'stop_on_stale_lockfile directive ignored in configuration-directory-file'
+			[[ $stop_on_stale_lockfile == [01] ]] || Warn "stop_on_stale_lockfile can only be 0 or 1, not: $stop_on_stale_lockfile" ;;
+		*)
+			Warn "directive not recognized: ${directive[$1]}"
+	esac
+}
+
+
+#######################################################################################################################
+# Startup:  called from main
+# Purpose:  Read configuration-file, do checks, start logging, set locks, etc.
+#######################################################################################################################
+
+Startup() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	# read configfile and catch logfile and lockfile directives
+	local -i n=1
+	local -a line
+	while IFS=$'\t' read -a line
+	do
+		Echo 1 "Line $n: ${line[*]}"
+		directive[$n]=${line[0]}
+		argument1[$n]=${line[1]-}
+		argument2[$n]=${line[2]-}
+		argument3[$n]=${line[3]-}
+		[[ ${directive[$n]} = 'retain' ]] && directive[$n]='interval'
+		[[ ${directive[$n]} = 'logfile' ]] && logfile=${argument1[$n]}
+		[[ ${directive[$n]} = 'timestamplog' ]] && timestamplog=${argument1[$n]}
+		if [[ $configfile = "$soleconf" || $configfile = "$mainconf" ]]
+		then  # only use these directives from the sole or main configfile
+			[[ ${directive[$n]} = 'lockfile' ]] && lockfile=${argument1[$n]}
+			[[ ${directive[$n]} = 'stop_on_stale_lockfile' ]] && stop_on_stale_lockfile=${argument1[$n]}
+		fi
+		let ++n
+	done < <(command grep '^ *[^#]' "$configfile")
+
+	# only use lockfile from the sole or main configfile
+	if [[ $configfile = "$soleconf" || $configfile = "$mainconf" ]]
+	then
+		# Do atomic locking
+		if [[ -s $lockfile ]]
+		then  # lockfile exists and is not empty
+			pid=$(<"$lockfile")
+			if [[ -f /proc/$pid/exe ]]
+			then
+				Die "Lock-file $lockfile exists, owned by process $pid" 5
+			elif ((stop_on_stale_lockfile))
+			then
+				Die "Stale lock-file $lockfile exists and stop_on_stale_lockfile is set" 4
+			else
+				Echo 0 "Stale lockfile present, but stop_on_stale_lockfile not set"
+			fi
+		else
+			printf "%s" "$mainpid" >"$lockfile" || Die "Lockfile $lockfile unusable" $E_operation
+		fi
+	fi
+
+	((timestamplog)) && logfile="$logfile-$now"
+	logready=1
+	exec 4>"$logfile" && Echo 0 "logfile=$logfile" || Die "Logfile $logfile can't be written to, error: $?" $E_operation
+
+	Echo 0
+	Echo 0 '###############################################################START'
+	Echo 0 "Start of $self version $version, time: $now"
+	Echo 0 '==============================================================='
+	local text=''
+	[[ $configfile = "$mainconf" ]] && text=' main'
+	[[ $configfile = "$soleconf" ]] && text=' sole'
+	Echo 0 "Options from$text configuration-file $configfile:"
+
+	# checks on configuration-file contents and report
+	local -i b=1 i=1 foundforced=0 d
+	for d in "${!directive[@]}"
+	do
+		case "${directive[$d]}" in
+			interval)
+				[[ -n ${argument1[$d]} ]] && interval[$i]=${argument1[$d]} || Die "Interval/retain directive $i has no name" $E_configfile
+				[[ ${interval[$i]} = *'[_*]'* ]] && Die "Interval/retain directive $i has underscore or asterisk in name: ${interval[$i]}" $E_configfile
+				[[ -n ${argument2[$d]} ]] && intervalretain[$i]=${argument2[$d]} || Die "Interval/retain directive $i has no retain-number" $E_configfile
+				((intervalretain[$i] > 0)) || Die "Interval/retain directive $i has no positive value: ${intervalretain[$i]}" $E_configfile
+				# interval definitions
+				if [[ ${argument3[$d]-} ]]
+				then  # definition specified
+					intervaldef[$i]=${argument3[$d]#+}  # remove the first plus to prevent problems with date arithmetics
+					local offset=$(command date -d "2000-01-01 00:00:00 ${intervaldef[$i]}" $dateformat) &&\
+							Echo 0 "    intervaldefinition $i=${interval[$i]} is $offset into 2000" ||\
+							Die "Could not make sense of interval definition ${intervaldef[$i]}" 3
+				else  # definition not specified, check standard definitions
+					local found_std=0 s
+					for s in "${!std_interval[@]}"
+					do
+						if [[ ${std_interval[$s]} = "${argument1[$d]}" ]]
+						then
+							found_std=1
+							intervaldef[$i]=${std_intervaldef[$s]}
+						fi
+					done
+					((found_std)) || Die "Interval/retain directive $i has no definition" $E_configfile
+				fi
+				Echo 0 "  interval $i: ${interval[$i]} (${intervaldef[$i]}) retain ${intervalretain[$i]}"
+				if [[ ${interval[$i]} = "$forced_interval" ]]
+				then
+					foundforced=1
+					Echo 1 '  Forced'
+				fi
+				let ++i ;;
+			backup)
+				sourcedir[$b]=${argument1[$d]}
+				destdir[$b]=$snapshot_root/${argument2[$d]}
+				Echo 0 "  backup $b: from ${sourcedir[$b]} to ${destdir[$b]}"
+				let ++b ;;
+			*)
+				Single_argument $d ;;
+		esac
+	done
+
+	# check forced interval
+	if [[ $forced_interval ]] && ((foundforced=0))
+	then
+		Die "The --forced interval on the commandline in not defined: $forced_interval" 2
+	fi
+
+	# handle create_root
+	if [[ ${snapshot_root-} ]]
+	then
+		if [[ ! -d $snapshot_root ]] && ((no_create_root))
+		then
+			Die "Snapshot_root is no directory: $snapshot_root and no_create_root is set" 4
+		else
+			command mkdir -p $snapshot_root || Die "Cannot create snapshot_root: $snapshot_root" $E_operation
+		fi
+	else
+		Die "Directive snapshot_root must be present in configfile!" $E_configfile
+	fi
+
+	# do the cmd_preexec before the backups
+	if [[ ${cmd_preexec-} ]]
+	then
+		$cmd_preexec || Die "Error in cmd_preexec: $cmd_preexec" $E_operation
+	fi
+}
+
+
+#######################################################################################################################
+# Readlink:  called from Do_backup
+# Purpose:  Find the canonical name of a directory (replacement for readlink -f which doesn't work on FreeBSD)
+# Args:  $1 Target directory
+## Output to stdout: canonical directory name
+# Output to global variable Readlink: canonical directory name
+#######################################################################################################################
+
+Readlink() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	cd -P $1
+	declare -g Readlink="$(pwd -P)"
+	Echo 2 " >Readlink: $Readlink"
+}
+
+
+#######################################################################################################################
+# Getbackup:  called from Trash_backup Do_backup
+# Purpose:  Output dirname of oldest/newest backup for one interval or of all
+#           In case of newest of one interval, the due date will also be output
+#           The oldest in one interval should include forced as well.
+#           If the oldest is forced, 1 will be output (otherwise 0)
+# Args:  $1 Backup number
+#        $2 Interval number (0 means all)
+#        $3 String: 'oldest' or 'newest'
+## Output to stdout: String with: dirname (or '' if not present), and
+# Output to global variable Getbackup: String with: dirname (or '' if not present), and
+#                                      due date of the newest backup of one interval (or '' if not present), and
+#                                      1 if the oldest found is forced (otherwise 0), seperated by '|'
+#######################################################################################################################
+
+Getbackup() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	local -a backupdir  # ordered oldest to newest because of the sorting order of globbing
+	if (($2))
+	then  # specific interval
+		if [[ $3 = 'oldest' ]]
+		then
+			backupdir=(${destdir[$1]}/${bn}_${interval[$2]}*)  # matches forced as well as independent
+		else  # newest
+			backupdir=(${destdir[$1]}/${bn}_${interval[$2]})  # doesn't match forced
+		fi
+	else  # all intervals
+		backupdir=(${destdir[$1]}/${bn}_*)  # matches forced as well, but not independent
+	fi
+
+	local backup='' duedate=''
+	local -i oldestforced=0
+	if [[ ${backupdir-} ]]
+	then
+		if [[ $3 = 'oldest' ]]
+		then
+			backup=${backupdir[0]}
+			(($2)) && [[ $backup == *-forced ]] && oldestforced=1
+		else  # newest
+			local -i last=${#backupdir[@]}
+			backup=${backupdir[--last]}
+			if (($2))
+			then  # specific interval: give duedate
+				local datename=${backup##*/}
+				datename=${datename%_*}
+				Echo 2 "date-command: date -d \"${datename/_/ } ${intervaldef[$2]}\" +\"%Y-%m-%d_%H:%M:%S\""
+				duedate="$(date -d "${datename/_/ } ${intervaldef[$i]}" +"%Y-%m-%d_%H:%M:%S")"
+			fi
+		fi
+	fi
+	declare -g Getbackup="$backup|$duedate|$oldestforced"
+	Echo 2 "backupdirs=${backupdir[*]-}"
+	Echo 1 "backup $1=$backup duedate=$duedate oldestforced=$oldestforced"
+	Echo 2 " >Getbackup: $Getbackup"
+}
+
+
+#######################################################################################################################
+# Recycle_trash:  called from Do_backup
+# Purpose:  Recycles the appropriate backup for the interval if possible
+# Args:  $1 Backup number
+#        $2 Interval number
+#        $3 latest backup for this interval
+#        $4 due date of new backup for this interval
+#######################################################################################################################
+
+Recycle_trash() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	local trashdir=(${destdir[$1]}/trashcan${bn}*)  # matches forced and independent as well
+	Echo 2 "trashdirs=${trashdir[*]-}"
+	local trashdate dir
+	if [[ ${3-} ]]
+	then # function called with backup
+		local f
+		# see if there is a trashed backup that could be recycled as a 'new' backup for this interval
+		for f in "${trashdir[@]-}"
+		do  # ordered oldest to newest because of the sorting order of globbing
+			trashdate=${f##*/}  # short dirname
+			trashdate=${trashdate%_*}  # date in dirname
+			Echo 1 "  trashdir $f date=$trashdate"
+			if [[ $trashdate > "$4" ]]
+			then  # this trashed backup is newer than due date for this interval
+				dir="${destdir[$1]}/${trashdate}_${interval[$2]}"
+				command mv "$f" "$dir"  # the oldest suitable one
+				Echo 0 "    Recycle suitable trashdir=$f to dest=$dir"
+				break
+			fi
+		done
+	else  # no backup provided in function call for this interval
+		if [[ ${trashdir-} ]]
+		then  # get the last (most recent) from trashcan
+			local last=$((${#trashdir[@]}-1))  # last element of sequential array starting at 0
+			trashdate=${trashdir[$last]##*/}
+			dir="${destdir[$1]}/${trashdate%_*}_${interval[$2]}"
+			command mv "${trashdir[$last]}" "$dir"
+			Echo 0 "    Recycle latest trashdir=${trashdir[$last]} to dest=$dir"
+		fi
+	fi
+}
+
+
+#######################################################################################################################
+# Trash_backup:  called from Do_backup
+# Purpose:  Move expired backups to the trashcan
+# Args:  $1 Backup number
+#        $2 Interval
+## Output to stdout:  0 (if count < intervalretain), else 1
+# Output to global variable Trash_backup:  0 (if count < intervalretain), else 1
+#######################################################################################################################
+
+Trash_backup() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	local trashdir="${destdir[$1]}/trashcan"
+	mkdir -p "$trashdir"  # no error if already existing because of -p
+
+	# count normal backups only
+	local -i count=$(command grep -c "${bn}_" <<<"$(command find ${destdir[$1]} -maxdepth 1 -name "*_${interval[$2]}" -type d 2>/dev/null)")
+	Echo 1 "Trash backup $1 for interval ${interval[$2]} count=$count retain=${intervalretain[$2]}"
+	# we just made a backup, so there is always at least 1
+	Getbackup $1 $2 'oldest'
+	Echo 2 "getbackup=$Getbackup"
+	local oldest=${Getbackup%%|*} oldestforced=${Getbackup##*|}
+	# while there are enough proper ones
+	declare -g -i Trash_backup=0
+	while ((count>=intervalretain[$2]))
+	do
+		Trash_backup=1
+		# if the oldest is a forced one, or if there are more than enough proper ones: delete
+		if ((oldestforced)) || ((count>intervalretain[$2]))
+		then
+			# double check that it's really a proper snapshot file, and trash it
+			if command grep -q "${bn}_${interval[$2]}\(-forced\)\?" <<<"${oldest##*/}"
+			then
+	      Echo 1 "  Moving $oldest to $trashdir"
+				command mv "$oldest" "$trashdir" || Die "ERROR: failed to trash expired snapshot from $oldest, inexplicable" $E_operation
+			else
+	      Echo 2 "oldest=$oldest"
+				[[ $oldest ]] && Die "Won't remove directory $oldest, not the proper format for a snapshot" $E_internal
+			fi
+			((oldestforced)) || let count--  # only decrease the count for removal of normal backups
+			Echo 2 "count=$count"
+		else
+			break  # stop deleting when just the right number of proper backups
+		fi
+		# read the next oldest
+		Getbackup $1 $2 'oldest'
+		oldest=${Getbackup%%|*} oldestforced=${Getbackup##*|}
+	done
+	Echo 2 " >Getbackup: $Getbackup"
+}
+
+
+#######################################################################################################################
+# Purge_trash:  called from Do_backup
+# Purpose:  Prune trashcan
+# Args:  $1 Backup number
+#        $2 Earliest due date of all intervals in the current backup
+#######################################################################################################################
+
+Purge_trash() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	# all trash older than earliestdue is useless, so delete
+	local trashdir=(${destdir[$1]}/trashcan$bn*)  # matches forced and independent as well
+	Echo 2 "trashdirs=${trashdir[*]-}"
+	Echo 1 "earliestdue=$2"
+	local shortname datename
+	local -i f last=$((${#trashdir[@]}-1))
+	for f in "${!trashdir[@]}"
+	do  # ordered oldest to newest because of the sorting order of globbing
+		if ((reuse_trash)) && ((f==last))
+		then  # if reuse_trash, then never delete the last (newest) trash
+			break
+		fi
+		shortname=${trashdir[$f]##*/}
+		datename=${shortname%_*}
+		Echo 1 "  trashdir $shortname date=$datename"
+		if [[ $datename < "$2"  ]]
+		then  # this trashed backup is too old
+			command rm -r -- "${trashdir[$f]}" || Echo 0 "      Failed to remove ${trashdir[$f]}"
+			Echo 0 "      Permanently deleting ${trashdir[$f]}"
+		else  # this one and the next ones are still potentially usefull
+			Echo 2 "The rest of the trash is still useful for potential recycling, $f <= ${#trashdir[@]}"
+			break
+		fi
+	done
+}
+
+
+#######################################################################################################################
+# Do_backup:  called from main
+# Purpose:  Process the backup directive
+# Args:  $1 Backup number
+#######################################################################################################################
+
+Do_backup() {
+	Echo 0
+	Echo 0 '---------------------------------------------------------------------------'
+	Echo 0 "Processing backup $1 from ${sourcedir[$1]} to ${destdir[$1]}"
+	Echo 0
+
+	# check sourcedir empty
+	if ! [[ ${sourcedir[$1]}/* ]]
+	then
+		Echo 0 "Source directory for backup $1 is empty: ${sourcedir[$1]}. Is it not mounted?"
+		Echo 0 "Aborting backup $1, continuing with the rest of the tasks"
+		return
+	fi
+
+	# interrupted backups present, can't trust their integrity, so remove them
+	local interrupted
+	for interrupted in "${destdir[$1]}"/interrupted-backup.*
+	do  # nullglob set, so OK if non-existent
+		Echo 0 "  	Removing $interrupted"
+		command rm -r -- "$interrupted" || Die "Could not remove all interrupted-backups in ${destdir[$1]}" $E_operation
+	done
+
+	# check for backups in the future
+	Getbackup $1 0 'newest'
+	local mostrecent="${Getbackup%%|*}"  # used for pre-linking
+	local datename=${mostrecent##*/}
+	datename=${datename%_*}
+	if [[ $datename > "$now" ]]
+	then  # '' < date, so in case datename='' this won't run
+		Echo 0 "The time is $now, the most recent backup $mostrecent is in the future: $datename"
+		if ((independent))
+		then
+			Echo 1
+			Echo 1 'Persistant backup requested, will continue anyway'
+		else
+			Echo 1
+			Echo 1 'Options:'
+			Echo 1 '- Adjust system clock forward'
+			Echo 1 '- Use the --date option to specify a time'
+			Echo 1 '- Just wait'
+			Echo 1 '- Move snapshots elsewhere that are in the future'
+			Echo 1 '- Use --independent to create a independent snapshot'
+			Die 'Backups present in the future' 7
+		fi
+	fi
+
+	#? for this backup number: build arrays of existing backups + due dates, and trashed backups
+
+	# check from shortest interval upwards: sync due? removal due? retain fulfilled? (if not, no higher interval)
+	local latest duedate
+	local -i i synced=0 count retainfulfilled=0
+	local earliestdue='nothing'
+	for i in "${!interval[@]}"
+	do
+		Getbackup $1 $i 'newest'
+		latest=${Getbackup%%|*}
+		duedate=${Getbackup%|*}
+		duedate=${duedate#*|}
+		Echo 0 "interval $i=${interval[$i]} (${intervaldef[$i]}) latest=$latest duedate=$duedate now=$now synced=$synced retainfulfilled=$retainfulfilled"
+		# if a previous interval was already synced
+		if ((synced))
+		then
+			# if a previous interval had its retain fulfilled, and the current interval needs a backup
+			if ((retainfulfilled)) && [[ $latest = '' || $now > "$duedate" || $forced_interval = "${interval[$i]}" ]]
+			then
+				Recycle_trash "$1" "$i" "$latest" "$duedate"
+			fi
+		else  # sync hasn't happened yet
+			# if independent, or not yet present, or already due, or forced: make a new backup
+			if ((independent)) || [[ ((retainfulfilled)) && ($latest = '' || $now > "$duedate" || $forced_interval = "${interval[$i]}") ]]
+			then
+				# make per-backup arrangements
+				command mkdir -p "${destdir[$1]}" || Die "Cannot create backup destination: ${destdir[$1]}" $E_operation
+				Readlink "${destdir[$1]}"
+				local newbackup="$Readlink/interrupted-backup.$RANDOM"
+				until [[ ! -d $newbackup ]]
+				do
+					newbackup="$newbackup$RANDOM"
+				done
+
+				# find newest trash if reuse_trash is set
+				if ((reuse_trash))
+				then
+					local trashdir=(${destdir[$1]}/trashcan$bn*)  # matches forced and independent as well
+					local -i dirs=${#trashdir[@]}  # number of elements in simple sequential array starting at 0
+					Echo 2 "number of trashdirs=$dirs pattern=${destdir[$1]}/trashcan$bn*"
+				fi
+
+				# --link-dest does not play nice with relative paths, so readlink is used
+				# if mostrecentsource present, then pre-linking or using link-dest; if not, only rsync, no link-dest
+				local linkdestarg=''
+				if ((reuse_trash)) && ((dirs))
+				then  # move found trash to $newbackup
+					# $((dirs-1)) references last element because there is at least 1 element, sequential index starts at 0
+					Echo 1 "  Prelinking from trashdir ${trashdir[$((dirs-1))]}"
+					command mv "${trashdir[$((dirs-1))]}" "$newbackup"
+				else
+					command mkdir $newbackup || Die "Cannot create temporary backup destination: $newbackup" $E_operation
+					if [[ $mostrecent ]]
+					then  # backups already present
+						Readlink "$mostrecent"
+						local mostrecentsource="$Readlink"
+						Echo 1 "  Prelinking from last snapshot $mostrecentsource"
+						if ((link_dest))
+						then
+							# --link-dest breaks hard links when permissions change: waste of space
+							linkdestarg="--link-dest=\"$mostrecentsource/\""
+							Echo 1 "    using 'link-dest'"
+						else
+							# pre-link from the mostrecent directory before rsync-ing
+							# cpio instead of cp -al, more BSD-friendly and might work better
+							if ((cpio))
+							then
+								Echo 1 "    using 'cpio'"
+								# no need for a subshell, only this function affected by cd
+								cd -P "$mostrecentsource"
+								command find . -depth -print0 |command cpio --null --quiet -pdml "$newbackup" ||\
+										Die "Failed to 'cpio' pre-link from $mostrecentsource to $newbackup" 5
+							else
+								Echo 1 "    using 'cp -al'"
+								# dotglob is set to catch .* as well
+								command cp -al "$mostrecentsource"/* "$newbackup" || Die "'cp -al' pre-link from $mostrecentsource to $newbackup failed" $E_operation
+							fi
+						fi
+					fi
+				fi
+
+				# actual rsync, but not yet committed; if it is never committed, it will remain in interrupted-backup
+				Echo 1 "rsync-ing ${sourcedir[$1]} to $newbackup"
+				local rsynccom="$cmd_rsync $rsync_long_args $rsync_short_args $linkdestarg ${sourcedir[$1]}/ $newbackup"
+				Echo 2 "rsync-command=$rsynccom"
+				local -i t=0
+				while ((t<rsync_tries))
+				do
+					Echo 1 "rsync $t maxtries=$rsync_tries"
+					$rsynccom && break
+					let ++t
+				done
+				((t=rsync_tries)) || Die "Error rsync-ing backup $1, tried $rsync_tries times, the rsync-command was: $rsynccom" $E_operation
+
+				# determine destination directory name, also depends on interval
+				local dest
+				Echo 2 "independent=$independent duedate=$duedate"
+				if ((independent))
+				then
+					# hyphen instead of underscore after $now prevents matching on non-independent backups
+					dest=${destdir[$1]}/$now-$independent_name
+				elif [[ $latest = '' || $now > "$duedate" ]]
+				then  # not yet present or already due
+					dest=${destdir[$1]}/${now}_${interval[$i]}
+				else  # this interval was forced
+					dest=${destdir[$1]}/${now}_${interval[$i]}-forced
+				fi
+
+				# actual commit
+				Echo 0 "      COMMIT: moving $newbackup to $dest"
+				command mv -n "$newbackup" "$dest" || Die "Failed to move $newbackup to $dest" $E_operation
+				command ln -sf "$dest" "${destdir[$1]}/$symlinkname"
+				synced=1
+				duedate="$(command date -d "${now/_/ } ${intervaldef[$i]}" +"%Y-%m-%d_%H:%M:%S")"
+			# else: not independent, and at least one already, and the latest wasn't due, and this interval isn't forced
+			fi
+		# else: sync not yet happened, or previous retain not yet full, or backup not necessary
+		fi
+
+		# trash expired backups, remember whether retain was fulfilled
+		Trash_backup $1 $i
+		retainfulfilled=$Trash_backup
+
+		# update the earliest duedate for cleanup
+		if [[ $duedate ]]
+		then
+			Echo 1 "i=$i duedate=$duedate"
+			[[ $earliestdue > "$duedate" ]] && earliestdue=$duedate
+		fi
+	done
+
+	# cleanup lingering trash if anything is due
+	[[ $earliestdue = 'nothing' ]] || Purge_trash $1 $earliestdue
+}
+
+
+#######################################################################################################################
+# Post_exec:  called from main
+# Purpose:  Finalize the backups in this configfile, prepare for the next
+#######################################################################################################################
+
+Post_exec() {
+	Echo 2 " <$*> ${FUNCNAME[@]}"
+	# execute cmd_postexec after the last sync for this configfile
+	if [[ ${cmd_postexec-} ]]
+	then
+		$cmd_postexec || Die "Error in cmd_postexec: $cmd_postexec" $E_operation
+	fi
+	Echo 1
+	Echo 1 '###############################################################'
+}
+
+
+#######################################################################################################################
+# Finish:  called from main
+# Purpose:  Finish gracefully
+#######################################################################################################################
+
+Finish() {
+	Echo 0
+	Echo 0 "END of $self version $version time: $(command date +"%Y-%m-%d_%H:%M:%S")"
+	Echo 0 '###############################################################END'
+	Echo 0
+	Exit_script 0
+}
+
+
+#######################################################################################################################
+# Main
+#######################################################################################################################
+
+# initialize for the whole run and process commandline
+Initialize "${@-}"
+
+# process all the configfiles
+for configfile in "$soleconf" "$mainconf" "$confdir"/*
+do  # nullglob set, "$confdir/*" could be empty
+	# process configfile
+	Startup
+	# do all the backups
+	for b in "${!sourcedir[@]}"
+	do
+		Do_backup $b
+	done
+	# finalize backups and prepare for the next
+	Post_exec
+	[[ $soleconf ]] && break  # if --soleconf given, then only process that configfile
+	# set defaults that can be overridden by any configfile
+	Config
+done
+
+# finalize the whole run
+Finish
+
