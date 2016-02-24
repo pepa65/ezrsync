@@ -1,14 +1,12 @@
 
-# ezrsync 0.59-beta
+# ezrsync 0.60
 
  Git repo: http://github.com/pepa65/ezrsync
 
- Copyright 2012, 2013 by dagurasuforge, pepa65 (sourceforge.net ids)
-
+ Copyright 2012-2016 by dagurasuforge, pepa65 (sourceforge.net ids)
  License GNU GPLv3+  <http://gnu.org/licenses/gpl.html>
  This is free software: you are free to change and redistribute it.
  There is NO WARRANTY, to the extent permitted by law.
-
 
 ## Overview
 
@@ -50,9 +48,9 @@
 
  2. Either place the config in '/etc/ezrsync.conf' or in '/etc/ezrsync.conf.d/' or run this script as:
 
-	   'ezrsync --mainconf <configfile>'  or  'ezrsync --soleconf <configfile>'
+    'ezrsync --mainconf &lt;configfile&gt;'  or  'ezrsync --soleconf &lt;configfile&gt;'
 
-	   If there are scripts present in '/etc/ezrsync.conf.d/' directory, they are (also) all run. This directory
+    If there are scripts present in '/etc/ezrsync.conf.d/' directory, they are (also) all run. This directory
     can only be changed in the main configuration file, either in the default one or in the one given
     as a commandline option after '--mainconf'.
      When '--soleconf' is used, only the specified config file is used, and none of the scripts in any directory.
@@ -64,7 +62,7 @@
     If a main configuration file is present at the default location or specified, it will be used first,
     and then all the configuration files that are present in the default or specified configuration directory.
     For each configuration file, all unspecified directives will be reset to default.
-	
+
  3. Run ezrsync in a single cron entry, no arguments required, like this (for example every 15 minutes):
 
 	   */15 * * * *  root  /usr/local/bin/ezrsync
@@ -73,10 +71,10 @@
     is still running. If the cron-interval is bigger than the smallest interval, chances are the larger intervals
     never get any backups. (A crontab.d script could be packaged with ezrsync without needing user intervention,
     except if the smallest used interval is smaller than the crontab that is packaged.)
-	
+
  4. If the source is empty, the backup will not proceed, so backups will not be erased.
 
-	   So if you use sources that are mounted, make sure the mount-directories are empty when not mounted!
+    So if you use sources that are mounted, make sure the mount-directories are empty when not mounted!
     A good idea is to use 'chattr +i' when unmounted to make them unwritable even to root, because
     files tend to get accidentally written to unmounted mount points. Backups will over time be replaced
     by the files that are present in unmounted source directories. Even if this happens once, the hard links
@@ -104,27 +102,27 @@
 ## Special features
 
  1. Compatibility with the rsnapshot configuration-file:
- 	- They can be processed, but might not fully work as expected unless attention is paid to the Missing features
+   - They can be processed, but might not fully work as expected unless attention is paid to the Missing features
      above. Both 'retain' and 'interval' directives are understood, and the final argument can be the definition of
      the interval (required for interval names other than hourly, daily, weekly, monthly and yearly).
- 	- These rsnapshot directives are recognised and implemented: 'snapshot_root', 'no_create_root', 'cmd_rsync',
+   - These rsnapshot directives are recognised and implemented: 'snapshot_root', 'no_create_root', 'cmd_rsync',
      'cmd_preexec', 'cmd_postexec', 'retain'/'interval', 'verbose', 'loglevel', 'logfile', 'lockfile', 'stop_on_stale_lockfile',
      'rsync_short_args', 'rsync_long_args', 'link_dest' (which by default uses 'find|cpio') and 'backup'.
      In addition, the following directives are implemented:
- 		- 'timestamplog' (takes 0/1) to specify whether the logfile needs to be time-stamped
- 		- 'confdir' to specify a configuration-file-directory different from the default
- 		- 'rsync_tries' (takes a positive integer) to specify how many times the rsync-command needs to be tries
- 		- 'cpio' (takes 0/1) to specify whether 'cpio' or 'cp -al' is used
- 		- 'reuse_trash' (takes 0/1) to use expired backups as a rsync target in order to skip prelinking
+     - 'timestamplog' (takes 0/1) to specify whether the logfile needs to be time-stamped
+     - 'confdir' to specify a configuration-file-directory different from the default
+     - 'rsync_tries' (takes a positive integer) to specify how many times the rsync-command needs to be tried
+     - 'cpio' (takes 0/1) to specify whether 'cpio' or 'cp -al' is used
+     - 'reuse_trash' (takes 0/1) to use expired backups as a rsync target in order to skip prelinking
      (Note: while 'rsync --link-dest' does keep the permissions history, it does so at the expense of
      not hard-linking otherwise identical files. So in case all file permisions get changed,
      backing up using '--link-dest' will copy all files instead of hard-linking them!)
- 	- Directives and arguments are seperated by tabs. All directives have 1 argument, except:
- 		- retain/interval: '<interval> <retain> [<definition>]' (if no definition, <interval> must be standard)
- 		- backup: '<source-directory> <destination-directory>'
- 	- There can only be more than one of the 'interval'/'retain' and 'backup' directives.
+   - Directives and arguments are seperated by tabs. All directives have 1 argument, except:
+     - retain/interval: '&lt;interval&gt; &lt;retain&gt; [&lt;definition&gt;]' (if no definition, &lt;interval&gt; must be standard)
+     - backup: '&lt;source-directory&gt; &lt;destination-directory&gt;'
+   - There can only be more than one of the 'interval'/'retain' and 'backup' directives.
      If either of these is not present at all, nothing will happen.
- 	- The 'snapshot_root' directive is the only directive that is mandatory, all others have defined default values.
+   - The 'snapshot_root' directive is the only directive that is mandatory, all others have defined default values.
 
  2. The script can be run more often than the smallest backup cycle that is used, or less often (in the latter case
     the larger interval backups might never happen). No worrying about cron jobs interfering with one another.
