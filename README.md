@@ -1,7 +1,7 @@
 
 # ezrsync 0.60
 
- Git repo: http://github.com/pepa65/ezrsync
+ Git repo: http://gitlab.com/pepa65/ezrsync
 
  Copyright 2012-2016 by dagurasuforge, pepa65 (sourceforge.net ids)
  License GNU GPLv3+  <http://gnu.org/licenses/gpl.html>
